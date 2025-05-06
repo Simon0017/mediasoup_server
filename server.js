@@ -64,25 +64,53 @@ io.on('connection', (socket) => {
     socket.roomName = roomName;
     console.log(`User ${userId} joined room ${roomName}`);
 
-    // Notify new client of existing producers in the room
-    for (const [otherId, peer] of rooms[roomName].peers.entries()) {
-      if (otherId !== socket.id) {
-        console.log(`- Peer ${otherId} (${peer.userId}) has ${peer.producers?.length || 0} producers`);
-        for (const producer of peer.producers) {
-          const kind = producer.kind || producer.appData?.kind || 'unknown';
-          console.log(`  - Sending producer ${producer.id} (${kind}) from ${peer.userId}`);
+    // Notify  existing producers of new producer in the room
+    // for (const [otherId, peer] of rooms[roomName].peers.entries()) {
+    //   if (otherId !== socket.id) {
+    //     console.log(`- Peer ${otherId} (${peer.userId}) has ${peer.producers?.length || 0} producers`);
+    //     for (const producer of peer.producers) {
+    //       const kind = producer.kind || producer.appData?.kind || 'unknown';
+    //       console.log(`  - Sending producer ${producer.id} (${kind}) from ${peer.userId}`);
 
-          socket.emit('newProducer', {
+    //       socket.emit('newProducer', {
+    //         producerId: producer.id,
+    //         kind,
+    //         remoteuserId: peer.userId
+    //       });
+    //     }
+    //   }
+    // }
+
+    callback({ joined: true });
+  });
+
+  // Handler to your server.js Socket.IO connection
+  socket.on('getExistingProducers', () => {
+    const room = rooms[socket.roomName];
+    if (!room) {
+      console.error('Room not found when getting existing producers');
+      return;
+    }
+    
+    const existingProducers = [];
+    
+    // Collect all producers from all peers in the room
+    for (const [peerId, peer] of room.peers.entries()) {
+      if (peerId !== socket.id && peer.producers && peer.producers.length > 0) {
+        for (const producer of peer.producers) {
+          existingProducers.push({
             producerId: producer.id,
-            kind,
-            remoteuserId: peer.userId
+            kind: producer.kind || producer.appData?.kind,
+            userId: peer.userId
           });
         }
       }
     }
-
-    callback({ joined: true });
+    
+    console.log(`Sending ${existingProducers.length} existing producers to ${socket.id}`);
+    socket.emit('existingProducers', existingProducers);
   });
+
 
   socket.on('getRouterRtpCapabilities', (_, callback) => {
     callback(router.rtpCapabilities);
@@ -298,6 +326,7 @@ io.on('connection', (socket) => {
     const room = rooms[socket.roomName];
     if (room) {
       const peer = room.peers.get(socket.id);
+      const userId = peer.userId;
 
       if (peer) {
         // Close all transports & producers
@@ -307,8 +336,15 @@ io.on('connection', (socket) => {
       }
 
       room.peers.delete(socket.id);
-      console.log(`Socket ${socket.id} left room ${socket.roomName}`);
-      console.log(`Cleaned up peer ${socket.id} from room ${socket.roomName}`);
+      console.log(`Socket: ${socket.id} | userId:${userId} left room ${socket.roomName}`);
+      console.log(`Cleaned up peer ${socket.id} |  userId:${userId}  from room ${socket.roomName}`);
+
+      // Notify all remaining peers in the room about the user who left
+      room.peers.forEach(remainingPeer => {
+        if (remainingPeer.socket && remainingPeer.socket.connected) {
+          remainingPeer.socket.emit('user-disconnected', { userId: userId });
+        }
+      });
 
       // to check to clean up empty rooms
       if (room.peers.size === 0) {
