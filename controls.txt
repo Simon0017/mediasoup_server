@@ -1,0 +1,49 @@
+1. Basic Call Controls
+    Control ->	Purpose	Icon/Example
+    Mute/Unmute Mic ->	Toggle microphone on/off	🎤
+    Camera On/Off	-> Enable/disable video feed	📷
+    Screen Share	-> Share your screen/window	🖥️
+    End Call	-> Terminate the call	📞❌
+    Start/Stop Broadcast	-> Begin/end live streaming	📡
+2. Video & Audio Settings
+    Control	-> Purpose
+    Camera Switch	-> Toggle between front/back cameras
+    Microphone Selector	-> Choose input device (headset, mic, etc.)
+    Speaker Selector	-> Switch output device (speaker, headphones)
+    Video Quality	-> Adjust resolution (HD, SD, Auto)
+    Noise Suppression	-> Reduce background noise
+    Virtual Background	->Blur or change background
+3. Participant Management
+    Control	Purpose
+    Participant List	View all attendees
+    Raise Hand	Signal to speak (for large groups)
+    Mute All	Host mutes everyone (for webinars)
+    Remove Participant	Kick a user out
+    Admit/Reject	Manage waiting room (for private calls)
+4. Screen Sharing & Collaboration
+    Control	Purpose
+    Annotate	Draw on shared screen
+    Whiteboard	Collaborative drawing space
+    Pause Share	Temporarily stop sharing
+    Share Specific Window	Share only one app window
+5. Live Streaming & Broadcasting
+    Control	Purpose
+    Go Live	Start streaming to platforms (YouTube, Facebook)
+    RTMP Settings	Configure custom streaming servers
+    Live Chat	View audience messages
+    Stream Quality	Adjust bitrate/resolution
+    Record Session	Save call locally or to cloud
+6. Accessibility & UI Controls
+    Control	Purpose
+    Closed Captions	Enable live transcription
+    Pin Speaker	Focus on a specific participant
+    Gallery/Speaker View	Switch layout modes
+    Fullscreen	Enter/exit fullscreen mode
+    Reactions	Send emoji feedback (👍, ❤️)
+7. Advanced Controls (For Hosts)
+    Control	->Purpose
+    Breakout Rooms ->	Split call into smaller groups
+    Polling	Create -> live polls/quizzes
+    Waiting Room ->	Approve attendees manually
+    Co-Host	Assign -> moderator privileges
+    Lock Meeting ->	Prevent new joins

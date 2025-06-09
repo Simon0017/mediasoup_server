@@ -1,8 +1,11 @@
 const mediasoup = require('mediasoup');
 const { Server } = require('socket.io');
 const http = require('http');
+const { start } = require('repl');
 
 const rooms = {}; // roomName -> { peers: Map<socketId, peerData> }
+const roomModerators = {};
+const recordings = {};
 
 const server = http.createServer();
 const io = new Server(server, {
@@ -51,6 +54,11 @@ io.on('connection', (socket) => {
   socket.on('joinRoom', ({ roomName, userId }, callback) => {
     if (!rooms[roomName]) {
       rooms[roomName] = { peers: new Map() };
+
+      // first user becomes the moderator
+      roomModerators[roomName] = userId;
+      console.log(`${userId} is the moderator od room ${roomName}`);
+      
     }
 
     rooms[roomName].peers.set(socket.id, {
@@ -58,30 +66,15 @@ io.on('connection', (socket) => {
       userId,
       transports: [],
       producers: [],
-      consumers: []
+      consumers: [],
+      isMuted:false,
     });
 
     socket.roomName = roomName;
     console.log(`User ${userId} joined room ${roomName}`);
 
-    // Notify  existing producers of new producer in the room
-    // for (const [otherId, peer] of rooms[roomName].peers.entries()) {
-    //   if (otherId !== socket.id) {
-    //     console.log(`- Peer ${otherId} (${peer.userId}) has ${peer.producers?.length || 0} producers`);
-    //     for (const producer of peer.producers) {
-    //       const kind = producer.kind || producer.appData?.kind || 'unknown';
-    //       console.log(`  - Sending producer ${producer.id} (${kind}) from ${peer.userId}`);
-
-    //       socket.emit('newProducer', {
-    //         producerId: producer.id,
-    //         kind,
-    //         remoteuserId: peer.userId
-    //       });
-    //     }
-    //   }
-    // }
-
-    callback({ joined: true });
+    const isModerator = roomModerators[roomName] === userId;
+    callback({ joined: true,isModerator });
   });
 
   // Handler to your server.js Socket.IO connection
@@ -354,6 +347,278 @@ io.on('connection', (socket) => {
 
     }
   });
+
+  socket.on('endCallForAll',({roomName,userId},callback) =>{
+    console.log(`Ending call for all in room ${roomName} by user ${userId}`);
+    try {
+      console.log(`Ending call for all in room ${roomName} by user ${userId}`);
+
+      if(rooms[roomName]){
+        // noitify al peers that the cal is ending
+        rooms[roomName].peers.forEach((peer,socketId) =>{
+          peer.socket.emit('callEndedForAll',{'endedBY':userId});
+
+          // close all transports,producers and consumers for ach peer
+          peer.transports.forEach(t => t.close());
+          peer.producers.forEach(p => p.close());
+          peer.consumers.forEach(c => c.close());
+          console.log(`Closed all transports, producers and consumers for peer ${socketId}`);
+        });
+
+        // delete the room
+        delete rooms[roomName];
+        console.log(`Room ${roomName} deleted after ending call for all by ${userId}`);
+
+        if (callback){
+          callback({ success: true, message: `Call ended for all in room ${roomName}` });
+        }else{
+          console.log(`Room ${roomName} not found`);
+          if (callback) {
+            callback({ success: false, message: `Room ${roomName} not found` });
+          }
+          
+        }
+      }
+      
+    } catch (error) {
+      console.error('Error in endCallForAll:', error);
+      if (callback) {
+        callback({ success: false, message: error.message });
+      }
+    }
+  });
+
+  socket.on('leaveRoom',({roomName,userId},callback) =>{
+    try {
+      console.log(`User ${userId} is leaving room ${roomName}`);
+
+      if (rooms[roomName]) {
+        const peer = rooms[roomName].peers.get(socket.id);
+        if (peer) {
+          // Close all transports, producers, and consumers for the peer
+          peer.transports.forEach(t => t.close());
+          peer.producers.forEach(p => p.close());
+          peer.consumers.forEach(c => c.close());
+          console.log(`Closed all transports, producers, and consumers for user ${userId}`);
+        }
+
+        rooms[roomName].peers.delete(socket.id);
+        console.log(`User ${userId} left room ${roomName}`);
+
+        // Notify remaining peers in the room
+        rooms[roomName].peers.forEach(remainingPeer => {
+          if (remainingPeer.socket && remainingPeer.socket.connected) {
+            remainingPeer.socket.emit('user-disconnected', { userId: userId });
+          }
+        });
+
+        // Check to clean up empty rooms
+        if (rooms[roomName].peers.size === 0) {
+          delete rooms[roomName];
+          console.log(`Room ${roomName} deleted as it's now empty`);
+        }
+
+        if (callback) {
+          callback({ success: true, message: `User ${userId} left room ${roomName}` });
+        }
+      } else {
+        console.log(`Room ${roomName} not found`);
+        if (callback) {
+          callback({ success: false, message: `Room ${roomName} not found` });
+        }
+      }
+    } catch (error) {
+      console.error('Error in leaveRoom:', error);
+      if (callback) {
+        callback({ success: false, message: error.message });
+      }
+    }
+  });
+
+  // Start/Stop teh meeting recording
+  socket.on('toggleRecording',({roomName,userId},callback) =>{
+    if (roomModerators[roomName] !== userId){
+      return callback({error: "Only Moderators can control the recording"});
+    }
+
+    if (!recordings[roomName]){
+      // start the recording
+      recordings[roomName] = {
+        isRecording:true,
+        startTime: new Date(),
+        recordingId: `recording-${roomName}-${Date.now()}`,
+      };
+
+      // Notify all the users/participant iin the room
+      peer.socket.emit('recordingStarted', {
+        recordingId: recordings[roomName].recordingId,
+        startTime: recordings[roomName].startTime
+      });
+
+      callback({success:true,recording:recordings[roomName]});
+    }else{
+      // Stop the recording
+      const recordingData = recordings[roomName];
+      delete recordings[roomName];
+
+      // Notify participants 
+      rooms[roomName].peers.forEach(peer => {
+        peer.socket.emit('recordingStopped',{
+          duration:Date.now() - recordingData.startTime.getTime(),
+          recordingId: recordingData.recordingId,
+        });
+      });
+
+      callback({success:true,stopped:true});
+
+    }
+  });
+
+  // Get the participants list
+  socket.on('getParticipants',(callback) => {
+    const room = rooms[socket.roomName];
+    if (!room) {
+      console.error('Room not found when getting participants');
+      return callback({ error: 'Room not found' });
+    }
+
+    const participants = Array.from(room.peers.values()).map(peer => ({
+      userId: peer.userId,
+      isMuted: peer.isMuted,
+      socketId: peer.socket.id,
+      isMuted: peer.isMuted || false,
+      isProducing:{
+        audio: peer.producers?.some(p => p.kind === 'audio') || false,
+        video: peer.producers?.some(p => p.kind === 'video') || false,
+      }
+    }));
+
+    console.log(`Sending ${participants.length} participants to ${socket.id}`);
+    callback({ participants,moderator:roomModerators[socket.roomName] });
+
+  });
+
+  // Mute all the participants 
+  socket.on('muteAll',({roomName,userId},callback) =>{
+    if (roomModerators[roomName] !==userId){
+      return callback({error:'Only Moderators can call this action'});
+    }
+
+    const room = rooms[roomName];
+    if (!room) return callback({error:'Room not found'});
+
+    // Notify all particpants to mute themselves
+    room.peers.forEach((peer,socketId) =>{
+      if (socketId !== socket.id){ // dont mute the moderator
+        peer.socket.emit('forceAudioMute');
+        peer.isMuted = true;
+      }
+    });
+
+    callback({ success: true, message: `All participants muted by ${userId}` });
+
+  });
+
+  // Remove a particpant in the room
+  socket.on('kickParticipant',({roomName,userId,targetUserId},callback) =>{
+    if (roomModerators[roomName] !== userId) {
+      return callback({ error: 'Only moderator can kick participants' });
+    }
+    
+    const room = rooms[roomName];
+    if (!room) return callback({ error: 'Room not found' });
+
+    // find the target party
+    let targetSocket = null;
+    for (const[socketId,peer] of room.peers.entries()){
+      if (peer.userId === targetUserId) {
+        targetSocket = peer.socket;
+        break;
+      }
+    }
+
+    if(targetSocket){
+      targetSocket.emit('kicked',{by:userId});
+      targetSocket.disconnect(true); // force disconnect the target user
+      room.peers.delete(targetSocket.id);
+
+      callback({ success: true, message: `User ${targetUserId} kicked by ${userId}` });
+    }else{
+      callback({error:'Paricipant not found'});
+    }
+    
+  });
+
+  // Individual Mute
+  socket.on('muteParticipant',({roomName,userId,targetUserId,mute},callback) =>{
+    if (roomModerators[roomName] !== userId) {
+      return callback({ error: 'Only moderator can control participant audio' });
+    }
+    
+    const room = rooms[roomName];
+    if (!room) return callback({ error: 'Room not found' });
+
+    // Find and mute/unmute target participant
+    for (const [socketId, peer] of room.peers.entries()) {
+      if (peer.userId === targetUserId) {
+        peer.socket.emit(mute ? 'forceAudioMute' : 'forceAudioUnmute');
+        peer.isMuted = mute;
+        callback({ success: true, message: `${targetUserId} ${mute ? 'muted' : 'unmuted'}` });
+        return;
+      }
+    }
+    
+    callback({ error: 'Participant not found' });
+  
+  });
+
+  // Pause/Resume screen share
+  socket.on('pauseScreenShare', ({ producerId, pause }, callback) => {
+    const room = rooms[socket.roomName];
+    if (!room) return callback({ error: 'Room not found' });
+    
+    const peer = room.peers.get(socket.id);
+    if (!peer) return callback({ error: 'Peer not found' });
+    
+    const producer = peer.producers?.find(p => p.id === producerId);
+    if (!producer) return callback({ error: 'Producer not found' });
+    
+    if (pause) {
+      producer.pause();
+    } else {
+      producer.resume();
+    }
+    
+    // Notify other participants
+    room.peers.forEach((otherPeer, otherSocketId) => {
+      if (otherSocketId !== socket.id) {
+        otherPeer.socket.emit('screenSharePaused', { 
+          producerId, 
+          userId: peer.userId, 
+          paused: pause 
+        });
+      }
+    });
+    
+    callback({ success: true, paused: pause });
+  });
+
+  // Set stream quality
+  socket.on('setStreamQuality', ({ quality }, callback) => {
+    // quality: 'low', 'medium', 'high'
+    const qualitySettings = {
+      low: { width: 320, height: 240, frameRate: 15 },
+      medium: { width: 640, height: 480, frameRate: 24 },
+      high: { width: 1280, height: 720, frameRate: 30 }
+    };
+    
+    const settings = qualitySettings[quality] || qualitySettings.medium;
+    
+    // This would typically be handled on the client side
+    // Send back the quality settings for client to apply
+    callback({ success: true, settings });
+  });
+
 });
 
 server.listen(3000, () => {
