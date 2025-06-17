@@ -450,9 +450,11 @@ io.on('connection', (socket) => {
       };
 
       // Notify all the users/participant iin the room
-      peer.socket.emit('recordingStarted', {
-        recordingId: recordings[roomName].recordingId,
-        startTime: recordings[roomName].startTime
+      rooms[roomName].peers.forEach(peer => {
+        peer.socket.emit('recordingStarted', {
+          recordingId: recordings[roomName].recordingId,
+          startTime: recordings[roomName].startTime
+        });
       });
 
       callback({success:true,recording:recordings[roomName]});
