@@ -57,7 +57,7 @@ io.on('connection', (socket) => {
 
       // first user becomes the moderator
       roomModerators[roomName] = userId;
-      console.log(`${userId} is the moderator od room ${roomName}`);
+      console.log(`${userId} is the moderator of room ${roomName}`);
       
     }
 
