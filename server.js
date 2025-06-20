@@ -77,6 +77,15 @@ io.on('connection', (socket) => {
     callback({ joined: true,isModerator });
   });
 
+  // Handler for checking if the room exists
+  socket.on('checkStatus', ({ roomName }, callback) => {
+    if (rooms[roomName]) {
+      callback({ exists: true });
+    } else {
+      callback({ exists: false });
+    }
+  });
+
   // Handler to your server.js Socket.IO connection
   socket.on('getExistingProducers', () => {
     const room = rooms[socket.roomName];
