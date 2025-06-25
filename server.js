@@ -3,9 +3,23 @@ const { Server } = require('socket.io');
 const http = require('http');
 const { start } = require('repl');
 
+// importing libraries for the recording logic plus the recording logic
+const fs = require('fs');
+const path = require('path');
+const { exec } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
+
+const recordingDir = path.join(__dirname,'recordings');
+if (!fs.existsSync(recordingDir)){
+  fs.mkdirSync(recordingDir);
+}
+
+const activeRecordings = {}; // roomName -> recording session
+const mainVideoStreams = {}; // roomName -> { userId, producerId }
+const recordingConsumers = {}; // roomName -> consumer instance
+
 const rooms = {}; // roomName -> { peers: Map<socketId, peerData> }
 const roomModerators = {};
-const recordings = {};
 
 const server = http.createServer();
 const io = new Server(server, {
@@ -240,7 +254,18 @@ io.on('connection', (socket) => {
           });
         }
       }
-  
+      
+      // set main video when moderator produces video
+      if (kind === 'video' && peer.userId === roomModerators[socket.roomName]) {
+        if (!mainVideoStreams[socket.roomName]) {
+          mainVideoStreams[socket.roomName] = {
+            userId: peer.userId,
+            producerId: producer.id
+          };
+          notifyMainVideoChange(socket.roomName);
+        }
+      }
+      
       callback({ id: producer.id });
     } catch (err) {
       console.error('Error in produce:', err);
@@ -445,43 +470,115 @@ io.on('connection', (socket) => {
   });
 
   // Start/Stop teh meeting recording
-  socket.on('toggleRecording',({roomName,userId},callback) =>{
-    if (roomModerators[roomName] !== userId){
-      return callback({error: "Only Moderators can control the recording"});
-    }
+  socket.on('toggleRecording',async ({roomName,userId},callback) =>{
+    try {
+      if (roomModerators[roomName] !== userId){
+        return callback({error: "Only Moderators can control the recording"});
+      }
 
-    if (!recordings[roomName]){
+      const room = rooms[roomName];
+      if (!room) {
+        return callback({ error: "Room not found" });
+      }
+
       // start the recording
-      recordings[roomName] = {
-        isRecording:true,
-        startTime: new Date(),
-        recordingId: `recording-${roomName}-${Date.now()}`,
-      };
+      if (!activeRecordings[roomName]){
+        // check the main video
+        const mainVideo = mainVideoStreams[roomName];
+        if (!mainVideo){
+          return callback({error:"No main video stream set"});
+        }
+        
+        // find the main video Producer
+        let mainVideoProducer = null;
+        for (const peer of room.peers.values()) {
+          if (peer.userId === mainVideo.userId) {
+            mainVideoProducer = peer.producers.find(p => p.id === mainVideo.producerId);
+            if (mainVideoProducer) break;
+          }
+        }
 
-      // Notify all the users/participant iin the room
-      rooms[roomName].peers.forEach(peer => {
-        peer.socket.emit('recordingStarted', {
-          recordingId: recordings[roomName].recordingId,
-          startTime: recordings[roomName].startTime
+        if(!mainVideoProducer){
+          return callback({error:"Main video stream not available"});
+        }
+
+        const recordingId = `recording-${roomName}-${Date.now}`;
+        const filename = path.join(recordingDir, `${recordingId}.webm`);
+
+        // create a consumer for the mainvideo
+        const transport = room.peers.get(socket.id).transports[0]; // sung the moderators transport
+        const consumer = await transport.consume({
+          producerId: mainVideoProducer.id,
+          rtpCapabilities: router.rtpCapabilities,
+          paused: false
+        })
+
+        // set up the FFmeg process
+        const ffmpeg = exec(`${ffmpegPath} -f webm -i pipe:0 -c copy ${filename}`, {
+          stdio: ['pipe', 'ignore', 'ignore']
         });
-      });
 
-      callback({success:true,recording:recordings[roomName]});
-    }else{
-      // Stop the recording
-      const recordingData = recordings[roomName];
-      delete recordings[roomName];
+        // pipe video to FFMpeg
+        consumer.on('rtp',(rtpPacket)=>{
+          ffmpeg.stdin.write(rtpPacket.payload);
+        })
 
-      // Notify participants 
-      rooms[roomName].peers.forEach(peer => {
-        peer.socket.emit('recordingStopped',{
-          duration:Date.now() - recordingData.startTime.getTime(),
-          recordingId: recordingData.recordingId,
+        activeRecordings[roomName] = {
+          id: recordingId,
+          startTime: new Date(),
+          filename,
+          process: ffmpeg,
+          consumer
+        };
+
+        recordingConsumers[roomName] = consumer;
+
+        // Notify all the users/participant iin the room
+        room.peers.forEach(peer => {
+          peer.socket.emit('recordingStarted', {
+            recordingId,
+            startTime: activeRecordings[roomName].startTime,
+            mainVideoUserId: mainVideo.userId,
+          });
         });
-      });
 
-      callback({success:true,stopped:true});
+        return callback({success:true,recording: activeRecordings[roomName]});
+      }else{
+        // Stop the recording
+        const recording = activeRecordings[roomName];
+        
+        // close the consumer and process
+        recordingConsumers[roomName].close();
+        recording.process.stdin.end();
 
+        await new Promise(resolve => {
+          recording.process.on('exit', resolve);
+        });
+
+        const duration = Date.now() - recording.startTime.getTime();
+        delete activeRecordings[roomName];
+        delete recordingConsumers[roomName];
+
+        // Notify participants 
+        room.peers.forEach(peer => {
+          peer.socket.emit('recordingStopped',{
+            recordingId: recording.id,
+            duration,
+            mainVideoUserId: mainVideoStreams[roomName]?.userId,
+          });
+        });
+
+        return callback({
+          success:true,
+          stopped:true,
+          recordingId:recording.id,
+          duration,
+        });
+
+      }
+    } catch (error) {
+      console.error('Recording error:', err);
+      callback({ error: "Recording failed: " + err.message });
     }
   });
 
@@ -630,7 +727,109 @@ io.on('connection', (socket) => {
     callback({ success: true, settings });
   });
 
+  // set the main video
+  socket.on('setMainVideo',({roomName,userId,targetUserId},callback)=>{
+    try {
+      // Verify moderator privileges ******************REINTRODUCE THIS ROOM MOD CONTROL LATER************ 
+      // if (roomModerators[roomName] !== userId) {
+      //   return callback({ error: "Only moderators can set main video" });
+      // }
+
+      const room = rooms[roomName];
+      if (!room) return callback({ error: "Room not found" });
+      console.log(`Target User: ${targetUserId}`);
+      
+
+      // Find target user's video producer
+      let videoProducer = null;
+      for (const [_, peer] of room.peers) {
+        if (peer.userId === targetUserId) {
+          videoProducer = peer.producers.find(p => p.kind === 'video');
+          if (videoProducer) break;
+        }
+      }
+
+      if (!videoProducer) {
+        return callback({ error: "Target user has no video stream" });
+      }
+
+      // Update main video
+      mainVideoStreams[roomName] = {
+        userId: targetUserId,
+        producerId: videoProducer.id
+      };
+
+      // Notify all participants
+      room.peers.forEach(peer => {
+        peer.socket.emit('mainVideoChanged', {
+          userId: targetUserId,
+          producerId: videoProducer.id,
+          isInitial:false
+        });
+      });
+
+      callback({ success: true });
+    } catch (err) {
+      console.error('Error setting main video:', err);
+      callback({ error: "Failed to set main video" });
+    }
+  });
+
 });
+
+// function to notify the main video
+function notifyMainVideoChange(roomName) {
+  const room = rooms[roomName];
+  if (!room || !mainVideoStreams[roomName]) return;
+
+  const mainVideo = mainVideoStreams[roomName];
+  room.peers.forEach(peer => {
+    peer.socket.emit('mainVideoChanged', {
+      userId: mainVideo.userId,
+      producerId: mainVideo.producerId,
+      isInitial: false
+    });
+  });
+}
+
+// function to set the main defauif video
+async function setDefaultMainVideo(roomName) {
+  const room = rooms[roomName];
+  if (!room || mainVideoStreams[roomName]) return;
+
+  const moderatorId = roomModerators[roomName];
+  console.log(`Attempting to set default main video for room ${roomName}, moderator: ${moderatorId}`);
+
+  // Wait for moderator to produce video (with timeout)
+  let attempts = 0;
+  const maxAttempts = 10;
+  const checkInterval = 1000; // 1 second
+
+  const checkForVideo = setInterval(() => {
+    attempts++;
+    const moderatorPeer = [...room.peers.values()].find(p => p.userId === moderatorId);
+    
+    if (moderatorPeer) {
+      const videoProducer = moderatorPeer.producers.find(p => p.kind === 'video');
+      
+      if (videoProducer) {
+        clearInterval(checkForVideo);
+        mainVideoStreams[roomName] = {
+          userId: moderatorId,
+          producerId: videoProducer.id
+        };
+        console.log(`Set default main video to moderator ${moderatorId}'s stream`);
+        notifyMainVideoChange(roomName);
+      } else if (attempts >= maxAttempts) {
+        clearInterval(checkForVideo);
+        console.log(`Moderator ${moderatorId} has no video after ${maxAttempts} attempts`);
+      }
+    } else if (attempts >= maxAttempts) {
+      clearInterval(checkForVideo);
+      console.log(`Moderator peer not found after ${maxAttempts} attempts`);
+    }
+  }, checkInterval);
+}
 
 server.listen(3000, () => {
   console.log('Mediasoup server running at http://localhost:3000');
