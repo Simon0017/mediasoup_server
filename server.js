@@ -5,6 +5,7 @@ const { start } = require('repl');
 
 // importing libraries for the recording logic plus the recording logic
 const fs = require('fs');
+const { spawn } = require('child_process');
 const path = require('path');
 const { exec } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
@@ -469,117 +470,265 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Start/Stop teh meeting recording
-  socket.on('toggleRecording',async ({roomName,userId},callback) =>{
-    try {
-      if (roomModerators[roomName] !== userId){
-        return callback({error: "Only Moderators can control the recording"});
-      }
+  // Start/Stop the meeting recording   
+  socket.on('toggleRecording',async ({roomName,userId},callback) =>{     
+    try {       
+      if (roomModerators[roomName] !== userId){         
+        return callback({error: "Only Moderators can control the recording"});       
+      }        
 
-      const room = rooms[roomName];
-      if (!room) {
-        return callback({ error: "Room not found" });
-      }
+      const room = rooms[roomName];       
+      if (!room) {         
+        return callback({ error: "Room not found" });       
+      }        
 
-      // start the recording
-      if (!activeRecordings[roomName]){
-        // check the main video
-        const mainVideo = mainVideoStreams[roomName];
-        if (!mainVideo){
-          return callback({error:"No main video stream set"});
-        }
+      // start the recording       
+      if (!activeRecordings[roomName]){         
+        // check the main video         
+        const mainVideo = mainVideoStreams[roomName];         
+        if (!mainVideo){           
+          console.log("No Main Video set");           
+          return callback({error:"No main video stream set"});         
+        }                  
         
-        // find the main video Producer
-        let mainVideoProducer = null;
-        for (const peer of room.peers.values()) {
-          if (peer.userId === mainVideo.userId) {
-            mainVideoProducer = peer.producers.find(p => p.id === mainVideo.producerId);
-            if (mainVideoProducer) break;
+        // find the main video Producer         
+        let mainVideoProducer = null;         
+        for (const peer of room.peers.values()) {           
+          if (peer.userId === mainVideo.userId) {             
+            mainVideoProducer = peer.producers.find(p => p.id === mainVideo.producerId);             
+            if (mainVideoProducer) break;           
+          }         
+        }          
+
+        if(!mainVideoProducer){           
+          console.log('Main video stream not available');           
+          return callback({error:"Main video stream not available"});         
+        }          
+
+        // Debug producer status
+        console.log('=== PRODUCER DEBUG ===');
+        console.log('Producer ID:', mainVideoProducer.id);
+        console.log('Producer kind:', mainVideoProducer.kind);
+        console.log('Producer paused:', mainVideoProducer.paused);
+        console.log('Producer closed:', mainVideoProducer.closed);
+        
+        const producerStats = await mainVideoProducer.getStats();
+        console.log('Producer stats:', producerStats);
+
+        const recordingId = `recording-${roomName}-${Date.now()}`;         
+        const filename = path.join(recordingDir, `${recordingId}.webm`);         
+        console.log(`Recording Details:ID> ${recordingId}, filename> ${filename}`);
+        
+        // Debug file path and permissions
+        console.log('Recording directory:', recordingDir);
+        console.log('Directory exists:', fs.existsSync(recordingDir));
+        console.log('Full filename path:', filename);
+                  
+        // create a plainRTpTransport 
+        const transport = await router.createPlainTransport({
+          listenIp: { ip: '127.0.0.1' },
+          rtcpMux: false,
+          comedia: false
+        });
+
+        console.log("============TRANSPORT DEBUG============");
+        console.log('PlainRtpTransport created:', transport.tuple);
+
+        const { localIp, localPort } = transport.tuple;
+        console.log('PlainRtpTransport IP:', localIp, 'Port:', localPort);
+        const ffmpegPort = 5004;
+
+        
+        // Set up FFmpeg process for RTP stream - Fixed format
+        const ffmpeg = spawn(ffmpegPath, [
+          '-protocol_whitelist', 'file,udp,rtp',
+          '-f', 'rtp',
+          '-i', `rtp://127.0.0.1:${ffmpegPort}`,
+          '-c:v', 'libx264',
+          '-preset', 'ultrafast',
+          '-crf', '23',
+          filename
+        ]);
+        
+        await transport.connect({
+          ip: '127.0.0.1',
+          port: ffmpegPort,
+          rtcpPort: ffmpegPort
+        });
+        console.log('Transport connected to local IP:', localIp, 'Port:', localPort);
+        console.log('Transport connected to FFmpeg RTP stream');
+
+        // create a consumer for the mainvideo         
+        const consumer = await transport.consume({           
+          producerId: mainVideoProducer.id,           
+          rtpCapabilities: router.rtpCapabilities,           
+          paused: false  ,
+          // preferredLayers: { spatial: 2, temporal: 2 } // Add preferred layers       
+        });
+
+        // Debug consumer creation
+        console.log('=== CONSUMER DEBUG ===');
+        console.log('Consumer created successfully');
+        console.log('Consumer ID:', consumer.id);
+        console.log('Consumer closed:', consumer.closed);
+        console.log('Consumer paused:', consumer.paused);
+        console.log('Consumer producer paused:', consumer.producerPaused);
+        console.log('Consumer kind:', consumer.kind);
+        console.log('Consumer type:', consumer.type);
+
+        // Resume consumer if paused
+        if (consumer.paused) {
+          await consumer.resume();
+          console.log('Consumer resumed');
+        }
+
+        // Add FFmpeg error handling
+        ffmpeg.on('error', (error) => {
+          console.error('FFmpeg process error:', error);
+        });
+
+        ffmpeg.stderr.on('data', (data) => {
+          console.log('FFmpeg stderr:', data.toString());
+        });
+
+        ffmpeg.on('exit', (code) => {
+          console.log('FFmpeg process exited with code:', code);
+        });
+
+        console.log('FFmpeg process started with PID:', ffmpeg.pid);
+
+        // Enhanced RTP packet handling with debugging
+        let rtpPacketCount = 0;
+        consumer.on('rtp', (rtpPacket) => {
+          rtpPacketCount++;
+          if (rtpPacketCount === 1) {
+            console.log('First RTP packet received!');
           }
-        }
-
-        if(!mainVideoProducer){
-          return callback({error:"Main video stream not available"});
-        }
-
-        const recordingId = `recording-${roomName}-${Date.now}`;
-        const filename = path.join(recordingDir, `${recordingId}.webm`);
-
-        // create a consumer for the mainvideo
-        const transport = room.peers.get(socket.id).transports[0]; // sung the moderators transport
-        const consumer = await transport.consume({
-          producerId: mainVideoProducer.id,
-          rtpCapabilities: router.rtpCapabilities,
-          paused: false
-        })
-
-        // set up the FFmeg process
-        const ffmpeg = exec(`${ffmpegPath} -f webm -i pipe:0 -c copy ${filename}`, {
-          stdio: ['pipe', 'ignore', 'ignore']
+          if (rtpPacketCount % 100 === 0) {
+            console.log(`RTP packets received: ${rtpPacketCount}`);
+          }
+          
+          try {
+            ffmpeg.stdin.write(rtpPacket.payload);
+          } catch (error) {
+            console.error('Error writing to FFmpeg:', error);
+          }
         });
 
-        // pipe video to FFMpeg
-        consumer.on('rtp',(rtpPacket)=>{
-          ffmpeg.stdin.write(rtpPacket.payload);
-        })
-
-        activeRecordings[roomName] = {
-          id: recordingId,
-          startTime: new Date(),
-          filename,
-          process: ffmpeg,
-          consumer
-        };
-
-        recordingConsumers[roomName] = consumer;
-
-        // Notify all the users/participant iin the room
-        room.peers.forEach(peer => {
-          peer.socket.emit('recordingStarted', {
-            recordingId,
-            startTime: activeRecordings[roomName].startTime,
-            mainVideoUserId: mainVideo.userId,
-          });
+        // Add consumer event handlers for debugging
+        consumer.on('transportclose', () => {
+          console.log('Consumer transport closed');
         });
 
-        return callback({success:true,recording: activeRecordings[roomName]});
-      }else{
-        // Stop the recording
-        const recording = activeRecordings[roomName];
+        consumer.on('producerclose', () => {
+          console.log('Consumer producer closed');
+        });
+
+        consumer.on('producerpause', () => {
+          console.log('Consumer producer paused');
+        });
+
+        consumer.on('producerresume', () => {
+          console.log('Consumer producer resumed');
+        });
+
+        // Check consumer stats periodically for debugging - Fixed to avoid circular reference
+        const statsInterval = setInterval(async () => {
+          try {
+            const stats = await consumer.getStats();
+            console.log('Consumer stats available:', stats.length, 'entries');
+            // Look for RTP stats without causing circular reference
+            for (const stat of stats) {
+              if (stat.type === 'inbound-rtp' || stat.type === 'outbound-rtp') {
+                console.log(`${stat.type} - Packets: ${stat.packetsReceived || stat.packetsSent || 0}, Bytes: ${stat.bytesReceived || stat.bytesSent || 0}`);
+              }
+            }
+          } catch (error) {
+            console.error('Error getting consumer stats:', error);
+          }
+        }, 5000);
+
+        // Store the recording with clean object to avoid circular reference
+        activeRecordings[roomName] = {           
+          id: recordingId,           
+          startTime: new Date(),           
+          filename,           
+          process: ffmpeg,           
+          consumer: {
+            id: consumer.id,
+            closed: consumer.closed,
+            paused: consumer.paused
+          }, // Store only essential consumer properties
+          statsInterval // Store interval to clear it later
+        };          
+
+        recordingConsumers[roomName] = consumer;          
+
+        // Notify all the users/participant in the room         
+        room.peers.forEach(peer => {           
+          peer.socket.emit('recordingStarted', {             
+            recordingId,             
+            startTime: activeRecordings[roomName].startTime,             
+            mainVideoUserId: mainVideo.userId,           
+          });         
+        });                   
+
+        console.log("Recording started...");
+        console.log("If you don't see RTP packets, check producer activity and transport setup");
         
-        // close the consumer and process
-        recordingConsumers[roomName].close();
-        recording.process.stdin.end();
-
-        await new Promise(resolve => {
-          recording.process.on('exit', resolve);
-        });
-
-        const duration = Date.now() - recording.startTime.getTime();
-        delete activeRecordings[roomName];
-        delete recordingConsumers[roomName];
-
-        // Notify participants 
-        room.peers.forEach(peer => {
-          peer.socket.emit('recordingStopped',{
-            recordingId: recording.id,
-            duration,
-            mainVideoUserId: mainVideoStreams[roomName]?.userId,
-          });
-        });
-
+        // Return clean response without circular references
         return callback({
-          success:true,
-          stopped:true,
-          recordingId:recording.id,
-          duration,
-        });
+          success: true,
+          recording: {
+            id: recordingId,
+            startTime: activeRecordings[roomName].startTime,
+            filename: filename
+          }
+        });       
+      }else{         
+        // Stop the recording         
+        const recording = activeRecordings[roomName];                  
 
-      }
-    } catch (error) {
-      console.error('Recording error:', err);
-      callback({ error: "Recording failed: " + err.message });
-    }
+        // Clear the stats interval
+        if (recording.statsInterval) {
+          clearInterval(recording.statsInterval);
+        }
+
+        // close the consumer and process         
+        recordingConsumers[roomName].close();         
+        recording.process.stdin.end();          
+
+        await new Promise(resolve => {           
+          recording.process.on('exit', resolve);         
+        });          
+
+        const duration = Date.now() - recording.startTime.getTime();         
+        delete activeRecordings[roomName];         
+        delete recordingConsumers[roomName];          
+
+        // Notify participants          
+        room.peers.forEach(peer => {           
+          peer.socket.emit('recordingStopped',{             
+            recordingId: recording.id,             
+            duration,             
+            mainVideoUserId: mainVideoStreams[roomName]?.userId,           
+          });         
+        });          
+
+        console.log("Recording stopped. Duration:", duration, "ms");
+        console.log("Check file:", recording.filename);
+
+        return callback({           
+          success:true,           
+          stopped:true,           
+          recordingId:recording.id,           
+          duration,         
+        });        
+      }     
+    } catch (error) {       
+      console.error('Recording error:', error);       
+      callback({ error: "Recording failed: " + error.message });     
+    }   
   });
 
   // Get the participants list
