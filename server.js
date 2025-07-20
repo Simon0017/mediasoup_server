@@ -15,6 +15,12 @@ if (!fs.existsSync(recordingDir)){
   fs.mkdirSync(recordingDir);
 }
 
+// create a participant list to save in text form
+const participantList = path.join(__dirname,'Participants');
+if (!fs.existsSync(participantList)){
+  fs.mkdirSync(participantList);
+}
+
 const activeRecordings = {}; // roomName -> recording session
 const mainVideoStreams = {}; // roomName -> { userId, producerId }
 const recordingConsumers = {}; // roomName -> consumer instance
@@ -68,7 +74,10 @@ io.on('connection', (socket) => {
 
   socket.on('joinRoom', ({ roomName, userId }, callback) => {
     if (!rooms[roomName]) {
-      rooms[roomName] = { peers: new Map() };
+      rooms[roomName] = { 
+        peers: new Map() ,
+        participantsMeta: {} // userId -> { timeJoined, timeLeft }
+      };
 
       // first user becomes the moderator
       roomModerators[roomName] = userId;
@@ -88,7 +97,33 @@ io.on('connection', (socket) => {
     socket.roomName = roomName;
     console.log(`User ${userId} joined room ${roomName}`);
 
+    // setting the participantsMeta
+    rooms[roomName].participantsMeta[userId] = {
+      timeJoined : new Date().toISOString(),
+      timeLeft :null,
+    };
+
     const isModerator = roomModerators[roomName] === userId;
+
+    // Notify other users in the room about a new particpant
+    rooms[roomName].peers.forEach((peer, socketId) => {
+      if (socketId !== socket.id) {
+        peer.socket.emit('userJoined', { userId });
+      }
+    });
+
+    // Send the current participant list to the newly joined user
+    const participants = Array.from(rooms[roomName].peers.values()).map(peer => ({
+      userId: peer.userId,
+      isMuted: peer.isMuted,
+      socketId: peer.socket.id,
+      isProducing: {
+        audio: peer.producers?.some(p => p.kind === 'audio') || false,
+        video: peer.producers?.some(p => p.kind === 'video') || false,
+      }
+    }));
+    socket.emit('participantList', { participants, moderator: roomModerators[roomName] });
+    
     callback({ joined: true,isModerator });
   });
 
@@ -351,12 +386,19 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
+
     const room = rooms[socket.roomName];
     if (room) {
       const peer = room.peers.get(socket.id);
       const userId = peer.userId;
-
+      
       if (peer) {
+
+        // particpantsMteta Data
+        if (rooms[socket.roomName] && rooms[socket.roomName].participantsMeta[peer.userId]) {
+          rooms[socket.roomName].participantsMeta[peer.userId].timeLeft = new Date().toISOString();
+        }
+
         // Close all transports & producers
         peer.transports.forEach(t => t.close());
         peer.producers.forEach(p => p.close());
@@ -400,6 +442,9 @@ io.on('connection', (socket) => {
           console.log(`Closed all transports, producers and consumers for peer ${socketId}`);
         });
 
+        // partcipants Meta data
+        saveParticipantList(roomName);
+
         // delete the room
         delete rooms[roomName];
         console.log(`Room ${roomName} deleted after ending call for all by ${userId}`);
@@ -430,6 +475,11 @@ io.on('connection', (socket) => {
       if (rooms[roomName]) {
         const peer = rooms[roomName].peers.get(socket.id);
         if (peer) {
+
+          // Participant MetaData
+          if (rooms[socket.roomName] && rooms[socket.roomName].participantsMeta[peer.userId]) {
+            rooms[socket.roomName].participantsMeta[peer.userId].timeLeft = new Date().toISOString();
+          }
           // Close all transports, producers, and consumers for the peer
           peer.transports.forEach(t => t.close());
           peer.producers.forEach(p => p.close());
@@ -924,6 +974,25 @@ io.on('connection', (socket) => {
     }
   });
 
+  // handles the message from the clients
+  socket.on('sendMessage', ({ message, roomName, sender }) => {
+    // 🔊 Broadcast to all users in the same room (including sender)
+     rooms[roomName].peers.forEach((peer, socketId) => {
+      peer.socket.emit('receiveMessage', {
+        sender,
+        message,
+        timestamp: new Date().toLocaleString('en-US', {
+                weekday: 'long', 
+                hour: '2-digit',  
+                minute: '2-digit', 
+                hour12: true         
+              })
+
+      });
+    });
+    
+  });
+
 });
 
 // function to notify the main video
@@ -978,6 +1047,31 @@ async function setDefaultMainVideo(roomName) {
       console.log(`Moderator peer not found after ${maxAttempts} attempts`);
     }
   }, checkInterval);
+}
+
+// function to save the partipcants in a list
+function saveParticipantList(roomName) {
+  const room = rooms[roomName];
+  if (!room || !room.participantsMeta) return;
+
+  if (!fs.existsSync(participantList)) {
+    fs.mkdirSync(participantList, { recursive: true });
+  }
+
+  const lines = Object.entries(room.participantsMeta).map(([userId, meta]) =>
+    `UserID: ${userId}, Time Joined: ${meta.timeJoined}, Time Left: ${meta.timeLeft || 'Still in meeting'}`
+  );
+
+  const time = new Date().toISOString().replace(/[:.]/g, '-');
+  const safeRoomName = sanitizeFileName(roomName);
+
+  const filePath = path.join(participantList, `${safeRoomName}_participants_${time}.txt`);
+  fs.writeFileSync(filePath, lines.join('\n'), 'utf8');
+  console.log(`Participant list saved to ${filePath}`);
+}
+
+function sanitizeFileName(name) {
+  return name.replace(/[^a-z0-9_\-]/gi, '_'); // replaces non-safe characters with _
 }
 
 server.listen(3000, () => {
